@@ -1,0 +1,6 @@
+[package]
+name = "androrust"
+version = "0.1.0"
+authors = ["citronneur <citronneur@gmail.com>"]
+
+[dependencies]
