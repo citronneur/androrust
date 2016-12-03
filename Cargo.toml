@@ -3,4 +3,14 @@ name = "androrust"
 version = "0.1.0"
 authors = ["citronneur <citronneur@gmail.com>"]
 
+[lib]
+name = "androrust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "androaxml"
+path = "src/bin/androaxml.rs"
+
 [dependencies]
+zip = "0.2"
+byteorder = "0.5"
