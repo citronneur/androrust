@@ -12,6 +12,10 @@ const CHUNK_AXML_FILE: u32 = 0x00080003;
 const CHUNK_RESSOURCEIDS: u32 = 0x00080180;
 const CHUNK_XML_START_TAG: u32 = 0x00100102;
 const CHUNK_XML_START_NAMESPACE: u32 = 0x00100100;
+const CHUNK_XML_END_NAMESPACE: u32 = 0x00100101;
+const CHUNK_XML_END_TAG: u32 = 0x00100103;
+const CHUNK_XML_TEXT: u32 = 0x00100104;
+const CHUNK_XML_LAST: u32 = 0x00100104;
 
 #[derive(Debug)]
 pub enum AxmlError {
@@ -29,16 +33,27 @@ impl From<Error> for AxmlError {
     }
 }
 
-enum Event {
-    StartDocument,
-    StartTag(Tag),
+enum Chunk {
+    StartTag(Tag, Attribute),
+    EndTag(Tag),
     StartNamespace(Namespace),
-    EndNamespace(Namespace)
+    EndNamespace(Namespace),
+    Text(Text),
+    Resources(Vec<u32>)
+}
+
+struct Header {
+    size: u32,
+    line: u32,
 }
 
 struct Tag {
+    header: Header,
     namespace_uri: u32,
-    name: u32,
+    name: u32
+}
+
+struct Attribute {
     id_attribute: u16,
     class_attribute: u16,
     style_attribute: u16,
@@ -46,14 +61,33 @@ struct Tag {
 }
 
 struct Namespace {
+    header: Header,
     prefix: u32,
     uri: u32
+}
+
+struct Text {
+    header: Header,
+    name: u32,
+    unknown1: u32,
+    unknown2: u32
 }
 
 type AxmlResult<T> = Result<T, AxmlError>;
 
 pub struct Axml {
+    string_block: StringBlock,
+    chunks: Vec<Chunk>
+}
 
+fn read_header(buffer: &mut Read) -> Result<Header, AxmlError> {
+    let size = buffer.read_u32::<LittleEndian>()?;
+    let line = buffer.read_u32::<LittleEndian>()?;
+    buffer.read_u32::<LittleEndian>()?; // padding 0xFFFFFFFF
+    Ok(Header {
+        size: size,
+        line: line
+    })
 }
 
 impl Axml {
@@ -65,61 +99,90 @@ impl Axml {
 
         // read padding
         buffer.read_u32::<LittleEndian>()?;
-        let sb = StringBlock::read(buffer)?;
 
-        let mut ressource_ids = Vec::<u32>::new();
-        let mut first_start_tag = true;
-        let mut events = Vec::<Event>::new();
+        let string_blocks = StringBlock::read(buffer)?;
+        let mut chunks = Vec::<Chunk>::new();
 
         loop {
-            match buffer.read_u32::<LittleEndian>()? {
-                CHUNK_RESSOURCEIDS => {
-                    let chunk_size = buffer.read_u32::<LittleEndian>()?;
-                    if chunk_size < 8 || chunk_size % 4 != 0 {
-                        return Err(AxmlError::InvalidChunkSize);
-                    }
-                    for i in 0..(chunk_size / 4 - 2) {
-                        ressource_ids.push(buffer.read_u32::<LittleEndian>()?);
-                    }
-                },
-                CHUNK_XML_START_NAMESPACE => {
-                    events.push(Event::StartNamespace(Namespace {
-                        prefix: buffer.read_u32::<LittleEndian>()?,
-                        uri: buffer.read_u32::<LittleEndian>()?
-                    }))
-                },
-                CHUNK_XML_START_TAG if first_start_tag => {
-                    events.push(Event::StartDocument);
-                    first_start_tag = false;
-                },
-                CHUNK_XML_START_TAG => {
-                    let namespace_uri = buffer.read_u32::<LittleEndian>()?;
-                    let name = buffer.read_u32::<LittleEndian>()?;
-                    let attribute_count = buffer.read_u32::<LittleEndian>()?;
-                    let id_attribute = ((attribute_count >> 16) - 1) as u16;
-                    let class_and_style = buffer.read_u32::<LittleEndian>()?;
-                    let class_attribute = (class_and_style as u16) - 1;
-                    let style_attribute = ((class_and_style >> 16) - 1) as u16;
-                    let mut attributes = Vec::new();
+            chunks.push(
+                match buffer.read_u32::<LittleEndian>()? {
+                    CHUNK_RESSOURCEIDS => {
+                        let mut ressource_ids = Vec::<u32>::new();
+                        let chunk_size = buffer.read_u32::<LittleEndian>()?;
+                        if chunk_size < 8 || chunk_size % 4 != 0 {
+                            return Err(AxmlError::InvalidChunkSize);
+                        }
+                        for i in 0..(chunk_size / 4 - 2) {
+                            ressource_ids.push(buffer.read_u32::<LittleEndian>()?);
+                        }
+                        Chunk::Resources(ressource_ids)
+                    },
+                    CHUNK_XML_START_NAMESPACE => {
+                        Chunk::StartNamespace(Namespace {
+                            header: read_header(buffer)?,
+                            prefix: buffer.read_u32::<LittleEndian>()?,
+                            uri: buffer.read_u32::<LittleEndian>()?
+                        })
+                    },
+                    CHUNK_XML_END_NAMESPACE => {
+                        Chunk::EndNamespace(Namespace {
+                            header: read_header(buffer)?,
+                            prefix: buffer.read_u32::<LittleEndian>()?,
+                            uri: buffer.read_u32::<LittleEndian>()?
+                        })
+                    },
+                    CHUNK_XML_START_TAG => {
+                        let header = read_header(buffer)?;
+                        let namespace_uri = buffer.read_u32::<LittleEndian>()?;
+                        let name = buffer.read_u32::<LittleEndian>()?;
+                        let flags = buffer.read_u32::<LittleEndian>()?;
+                        let attribute_id_count = buffer.read_u32::<LittleEndian>()?;
+                        let id_attribute = (attribute_id_count >> 16) as u16;
+                        let attribute_count = attribute_id_count as u16;
+                        let class_and_style = buffer.read_u32::<LittleEndian>()?;
+                        let class_attribute = class_and_style as u16;
+                        let style_attribute = (class_and_style >> 16) as u16;
+                        let mut attributes = Vec::new();
 
-                    for i in 0..(attribute_count * ATTRIBUTE_LENGHT) {
-                        attributes.push(buffer.read_u32::<LittleEndian>()?)
-                    }
+                        for i in 0..(attribute_count as u32 * ATTRIBUTE_LENGHT) {
+                            attributes.push(buffer.read_u32::<LittleEndian>()?)
+                        }
 
-                    events.push(Event::StartTag(Tag {
-                        namespace_uri: namespace_uri,
-                        name: name,
-                        id_attribute: id_attribute,
-                        class_attribute: class_attribute,
-                        style_attribute: style_attribute,
-                        attributes: attributes
-                    }))
+                        Chunk::StartTag(Tag {
+                            header: header,
+                            namespace_uri: namespace_uri,
+                            name: name,
+                        }, Attribute {
+                            id_attribute: id_attribute,
+                            class_attribute: class_attribute,
+                            style_attribute: style_attribute,
+                            attributes: attributes
+                        })
+                    },
+                    CHUNK_XML_END_TAG => {
+
+                        Chunk::EndTag(Tag {
+                            header: read_header(buffer)?,
+                            namespace_uri: buffer.read_u32::<LittleEndian>()?,
+                            name: buffer.read_u32::<LittleEndian>()?
+                        })
+                    },
+                    CHUNK_XML_TEXT => {
+                        Chunk::Text(Text {
+                            header: read_header(buffer)?,
+                            name: buffer.read_u32::<LittleEndian>()?,
+                            unknown1: buffer.read_u32::<LittleEndian>()?,
+                            unknown2: buffer.read_u32::<LittleEndian>()?
+                        })
+                    },
+                    _ => { return Err(AxmlError::InvalidTag); }
                 }
-                _ => { return Err(AxmlError::InvalidTag); }
-            }
+            )
         }
-        Ok(Axml {
 
+        Ok(Axml {
+            string_block: string_blocks,
+            chunks: chunks
         })
     }
 }
@@ -183,10 +246,6 @@ impl StringBlock {
         buffer.read(&mut char_buffer);
 
         let styles_size = chunk_size - styles_offset;
-        if char_buffer_size % 4 != 0 {
-            return Err(AxmlError::InvalidStringBlockSize);
-        }
-
         let mut styles = Vec::<i32>::new();
         for i in 0..(styles_size / 4) {
             styles.push(buffer.read_i32::<LittleEndian>()?);
